@@ -17,7 +17,7 @@ package executor
 import (
 	"context"
 
-	kdv1 "github.com/bluek8s/kubedirector/pkg/apis/kubedirector.bluedata.io/v1alpha1"
+	kdv1 "github.com/bluek8s/kubedirector/pkg/apis/kubedirector/v1beta1"
 	"github.com/bluek8s/kubedirector/pkg/catalog"
 	"github.com/bluek8s/kubedirector/pkg/shared"
 	"github.com/go-logr/logr"
@@ -37,7 +37,6 @@ func CreateHeadlessService(
 	cr *kdv1.KubeDirectorCluster,
 ) (*corev1.Service, error) {
 
-	name := headlessServiceName
 	service := &corev1.Service{
 		TypeMeta: metav1.TypeMeta{
 			Kind:       "Service",
@@ -47,11 +46,12 @@ func CreateHeadlessService(
 			Namespace:       cr.Namespace,
 			OwnerReferences: ownerReferences(cr),
 			Labels:          labelsForService(cr, nil),
+			Annotations:     annotationsForCluster(cr),
 		},
 		Spec: corev1.ServiceSpec{
 			ClusterIP: "None",
 			Selector: map[string]string{
-				headlessServiceLabel: name + "-" + cr.Name,
+				HeadlessServiceLabel: cr.Name,
 			},
 			PublishNotReadyAddresses: true,
 			Ports: []corev1.ServicePort{
@@ -63,11 +63,11 @@ func CreateHeadlessService(
 		},
 	}
 	if cr.Status.ClusterService == "" {
-		service.ObjectMeta.GenerateName = name + "-"
+		service.ObjectMeta.GenerateName = headlessSvcNamePrefix
 	} else {
 		service.ObjectMeta.Name = cr.Status.ClusterService
 	}
-	err := shared.Client().Create(context.TODO(), service)
+	err := shared.Create(context.TODO(), service)
 
 	return service, err
 }
@@ -113,10 +113,11 @@ func CreatePodService(
 			APIVersion: "v1",
 		},
 		ObjectMeta: metav1.ObjectMeta{
-			Name:            serviceName(podName),
+			Name:            svcNamePrefix + podName,
 			Namespace:       cr.Namespace,
 			OwnerReferences: ownerReferences(cr),
 			Labels:          labelsForService(cr, role),
+			Annotations:     annotationsForCluster(cr),
 		},
 		Spec: corev1.ServiceSpec{
 			Selector:                 map[string]string{statefulSetPodLabel: podName},
@@ -131,7 +132,7 @@ func CreatePodService(
 		}
 		service.Spec.Ports = append(service.Spec.Ports, servicePort)
 	}
-	createErr := shared.Client().Create(context.TODO(), service)
+	createErr := shared.Create(context.TODO(), service)
 	return service, createErr
 }
 
@@ -222,16 +223,7 @@ func DeletePodService(
 		},
 	}
 
-	return shared.Client().Delete(context.TODO(), toDelete)
-}
-
-// serviceName is a utility function for generating the name of a service
-// from a given base string.
-func serviceName(
-	baseName string,
-) string {
-
-	return "svc-" + baseName
+	return shared.Delete(context.TODO(), toDelete)
 }
 
 // UpdateService updates a service
@@ -241,7 +233,7 @@ func UpdateService(
 	service *corev1.Service,
 ) error {
 
-	err := shared.Client().Update(context.TODO(), service)
+	err := shared.Update(context.TODO(), service)
 	if err == nil {
 		return nil
 	}
@@ -262,7 +254,7 @@ func UpdateService(
 	// If there was a resourceVersion conflict then fetch a more
 	// recent version of the object and attempt to update that.
 	currentService := &corev1.Service{}
-	err = shared.Client().Get(
+	err = shared.Get(
 		context.TODO(),
 		types.NamespacedName{
 			Namespace: service.Namespace,
@@ -283,8 +275,7 @@ func UpdateService(
 	}
 
 	currentService.Spec.Type = service.Spec.Type
-	currentService.Annotations = service.Annotations
-	err = shared.Client().Update(context.TODO(), currentService)
+	err = shared.Update(context.TODO(), currentService)
 	if err != nil {
 		shared.LogErrorf(
 			reqLogger,

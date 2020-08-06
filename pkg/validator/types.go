@@ -16,7 +16,6 @@ package validator
 
 import (
 	"k8s.io/api/admission/v1beta1"
-	logf "sigs.k8s.io/controller-runtime/pkg/runtime/log"
 )
 
 // admitFunc is used as the type for all the callback validators
@@ -24,21 +23,24 @@ type admitFunc func(*v1beta1.AdmissionReview) *v1beta1.AdmissionResponse
 
 type checkFunc func() error
 
-var log = logf.Log.WithName("Validator")
-
 const (
 	validatorServiceName = "kubedirector-validator"
 	validatorWebhook     = "kubedirector-webhook"
 	validatorSecret      = "kubedirector-validator-secret"
-	webhookHandlerName   = "validate-cr.kubedirector.bluedata.io"
+	webhookHandlerName   = "validate-cr.kubedirector.hpe.com"
 	validationPort       = 8443
 	validationPath       = "/validate"
+	healthPath           = "/healthz"
 	defaultNativeSystemd = false
 
 	appCrt  = "app.crt"
 	appKey  = "app.pem"
 	rootCrt = "ca.crt"
 
+	multipleSpecChange = "Change to spec not allowed before previous spec change has been processed."
+	pendingNotifies    = "Change to spec not allowed because some members have not processed notifications of previous change."
+
+	appInUse           = "KubeDirectorApp resource cannot be deleted or modified while referenced by the following KubeDirectorCluster resources: %s"
 	invalidAppMessage  = "Invalid app(%s). This app resource ID has not been registered."
 	invalidCardinality = "Invalid member count for role(%s). Specified member count:%d Role cardinality:%s"
 	invalidRole        = "Invalid role(%s) in app(%s) specified. Valid roles: \"%s\""
@@ -67,6 +69,8 @@ const (
 
 	failedToPatch = "Internal error: failed to populate default values for unspecified properties."
 
+	invalidStorageDef   = "Storage size for role (%s) is incorrectly defined."
+	invalidStorageSize  = "Storage size for role (%s) should be greater than zero."
 	invalidStorageClass = "Unable to fetch storageClass object with the provided name(%s)."
 
 	invalidRoleStorageClass = "Unable to fetch storageClassName(%s) for role(%s)."
@@ -75,4 +79,6 @@ const (
 
 	invalidResource = "Specified resource(\"%s\") value(\"%s\") for role(\"%s\") is invalid. Minimum value must be \"%s\"."
 	invalidSrcURL   = "Unable to access the specified URL(\"%s\") in file injection spec for the role (%s). error: %s."
+
+	maxMemberLimit = "Maximum number of total members per KD cluster supported is %d."
 )

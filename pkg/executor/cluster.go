@@ -17,7 +17,7 @@ package executor
 import (
 	"context"
 
-	kdv1 "github.com/bluek8s/kubedirector/pkg/apis/kubedirector.bluedata.io/v1alpha1"
+	kdv1 "github.com/bluek8s/kubedirector/pkg/apis/kubedirector/v1beta1"
 	"github.com/bluek8s/kubedirector/pkg/shared"
 )
 
@@ -32,7 +32,7 @@ func UpdateClusterStatus(
 	// emptystring, and remove any MemberStatus where Pod is emptystring.
 	compact(&(cr.Status.Roles))
 
-	return shared.Client().Status().Update(context.TODO(), cr)
+	return shared.StatusUpdate(context.TODO(), cr)
 }
 
 // compact edits the input slice of role statuses so that any elements that

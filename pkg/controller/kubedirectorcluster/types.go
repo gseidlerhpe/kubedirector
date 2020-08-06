@@ -15,7 +15,7 @@
 package kubedirectorcluster
 
 import (
-	kdv1 "github.com/bluek8s/kubedirector/pkg/apis/kubedirector.bluedata.io/v1alpha1"
+	kdv1 "github.com/bluek8s/kubedirector/pkg/apis/kubedirector/v1beta1"
 	appsv1 "k8s.io/api/apps/v1"
 )
 
@@ -24,7 +24,11 @@ type clusterState string
 const (
 	clusterCreating clusterState = "creating"
 	clusterUpdating              = "updating"
-	clusterReady                 = "ready"
+	clusterReady                 = "configured"
+	// ClusterSpecModified is exported because it is actually only used by
+	// the validator; declaring it here just to keep all cluster states in
+	// one spot.
+	ClusterSpecModified = "spec modified"
 )
 
 type clusterStateInternal int
@@ -39,13 +43,31 @@ const (
 type memberState string
 
 const (
-	memberCreatePending memberState = "create_pending"
+	memberCreatePending memberState = "create pending"
 	memberCreating                  = "creating"
-	memberConfigured                = "configured_internal" // not externally visible
-	memberReady                     = "ready"
-	memberDeletePending             = "delete_pending"
+	memberReady                     = "configured"
+	memberDeletePending             = "delete pending"
 	memberDeleting                  = "deleting"
-	memberConfigError               = "config_error"
+	memberConfigError               = "config error"
+)
+
+var creatingMemberStates = []string{
+	string(memberCreatePending),
+	string(memberCreating),
+}
+var deletingMemberStates = []string{
+	string(memberDeletePending),
+	string(memberDeleting),
+}
+
+const (
+	containerRunning      = "running"
+	containerWaiting      = "waiting"
+	containerInitializing = "initializing"
+	containerUnresponsive = "unresponsive"
+	containerTerminated   = "terminated"
+	containerMissing      = "absent"
+	containerUnknown      = "unknown"
 )
 
 const (
@@ -67,11 +89,10 @@ const (
 	rm -rf /opt/guestconfig/appconfig.tgz`
 	appPrepConfigStatus = "/opt/guestconfig/configure.status"
 	appPrepConfigRunCmd = `rm -f /opt/guestconfig/configure.* &&
-	touch ` + appPrepConfigStatus + ` &&
-	nohup sh -c "` + appPrepStartscript + ` --configure
-	2> /opt/guestconfig/configure.stderr
-	1> /opt/guestconfig/configure.stdout;
-	echo -n $? > ` + appPrepConfigStatus + `" &`
+	echo -n %s= > ` + appPrepConfigStatus + ` &&
+	nohup sh -c "` + appPrepStartscript + ` --configure;
+	echo -n $? >> ` + appPrepConfigStatus + `" > /opt/guestconfig/configure.stdout  
+	2> /opt/guestconfig/configure.stderr  &`
 	fileInjectionCommand = `mkdir -p %s && cd %s &&
 	curl -L %s -o %s`
 )

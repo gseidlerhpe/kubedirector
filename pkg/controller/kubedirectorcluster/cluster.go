@@ -15,18 +15,23 @@
 package kubedirectorcluster
 
 import (
+	"bytes"
 	"context"
+	"crypto/md5"
+	"encoding/hex"
 	"fmt"
 	"reflect"
+	"strconv"
 	"time"
 
-	kdv1 "github.com/bluek8s/kubedirector/pkg/apis/kubedirector.bluedata.io/v1alpha1"
+	kdv1 "github.com/bluek8s/kubedirector/pkg/apis/kubedirector/v1beta1"
 	"github.com/bluek8s/kubedirector/pkg/catalog"
 	"github.com/bluek8s/kubedirector/pkg/executor"
 	"github.com/bluek8s/kubedirector/pkg/observer"
 	"github.com/bluek8s/kubedirector/pkg/shared"
 	"github.com/go-logr/logr"
 	"github.com/google/uuid"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 )
 
@@ -51,13 +56,23 @@ func (r *ReconcileKubeDirectorCluster) syncCluster(
 	if cr.Status == nil {
 		cr.Status = &kdv1.KubeDirectorClusterStatus{}
 		cr.Status.Roles = make([]kdv1.RoleStatus, 0)
+		if cr.Status.SpecGenerationToProcess == nil {
+			initSpecGen := int64(0)
+			cr.Status.SpecGenerationToProcess = &initSpecGen
+		}
 	}
 
 	// Set a defer func to write new status and/or finalizers if they change.
 	defer func() {
+		syncMemberNotifies(reqLogger, cr)
+		updateStateRollup(cr)
 		nowHasFinalizer := shared.HasFinalizer(cr)
-		// Bail out if nothing has changed.
-		statusChanged := !reflect.DeepEqual(cr.Status, oldStatus)
+		// Bail out if nothing has changed. Note that if we are deleting we
+		// don't care if status has changed.
+		statusChanged := false
+		if (cr.DeletionTimestamp == nil) || nowHasFinalizer {
+			statusChanged = !reflect.DeepEqual(cr.Status, oldStatus)
+		}
 		finalizersChanged := (hadFinalizer != nowHasFinalizer)
 		if !(statusChanged || finalizersChanged) {
 			return
@@ -81,11 +96,14 @@ func (r *ReconcileKubeDirectorCluster) syncCluster(
 				}
 			}
 			// If any necessary status update worked, let's also update
-			// finalizers if necessary.
+			// finalizers if necessary. To be safe, don't include the status
+			// stanza in this write.
 			if (updateErr == nil) && finalizersChanged {
 				// See https://github.com/bluek8s/kubedirector/issues/194
 				// Migrate Client().Update() calls back to Patch() calls.
-				updateErr = shared.Client().Update(context.TODO(), cr)
+				crWithoutStatus := cr.DeepCopy()
+				crWithoutStatus.Status = nil
+				updateErr = shared.Update(context.TODO(), crWithoutStatus)
 			}
 			// Bail out if we're done.
 			if updateErr == nil {
@@ -102,6 +120,9 @@ func (r *ReconcileKubeDirectorCluster) syncCluster(
 					return
 				}
 			} else {
+				if currentCluster.DeletionTimestamp != nil {
+					statusChanged = false
+				}
 				// If we got a conflict error, update the CR with its current
 				// form, restore our desired status/finalizers, and try again
 				// immediately.
@@ -135,6 +156,8 @@ func (r *ReconcileKubeDirectorCluster) syncCluster(
 			time.Sleep(wait)
 		}
 	}()
+	// Calculate md5check sum to generate unique hash for connection object
+	currentHash := calcConnectionsHash(&cr.Spec.Connections, cr.Namespace)
 
 	// We use a finalizer to maintain KubeDirector state consistency;
 	// e.g. app references and ClusterStatusGens.
@@ -168,6 +191,8 @@ func (r *ReconcileKubeDirectorCluster) syncCluster(
 		)
 	}
 
+	checkContainerStates(reqLogger, cr)
+
 	clusterServiceErr := syncClusterService(reqLogger, cr)
 	if clusterServiceErr != nil {
 		errLog("cluster service", clusterServiceErr)
@@ -178,6 +203,17 @@ func (r *ReconcileKubeDirectorCluster) syncCluster(
 	if rolesErr != nil {
 		errLog("roles", rolesErr)
 		return rolesErr
+	}
+
+	// The "state" calculated above can be different on next handler pass,
+	// so we need to make sure we bump the spec gen now if necessary.
+	// If we delay doing this, a handler error (e.g. in syncMemberServices)
+	// could cause a handler exit and we would lose the necessary spec gen
+	// update.
+	if state == clusterMembersChangedUnready || (currentHash != cr.Status.LastConnectionHash) {
+		incremented := *cr.Status.SpecGenerationToProcess + int64(1)
+		cr.Status.SpecGenerationToProcess = &incremented
+		cr.Status.LastConnectionHash = currentHash
 	}
 
 	memberServicesErr := syncMemberServices(reqLogger, cr, roles)
@@ -194,9 +230,83 @@ func (r *ReconcileKubeDirectorCluster) syncCluster(
 				shared.EventReasonCluster,
 				"stable",
 			)
+
+			amIBeingConnectedToThis := func(otherCluster kdv1.KubeDirectorCluster) bool {
+				for _, connectedName := range otherCluster.Spec.Connections.Clusters {
+					if cr.Name == connectedName {
+						return true
+					}
+				}
+				return false
+			}
+
+			// Once the cluster is deemed ready, if this cluster is connected to any cluster then
+			// we need to notify that cluster that configmeta here has
+			// changed, so bump up connectionsGenerationToProcess for that cluster
+			allClusters := &kdv1.KubeDirectorClusterList{}
+			shared.List(context.TODO(), allClusters)
+			// notify clusters to which this cluster is
+			// connected
+			for _, kubecluster := range allClusters.Items {
+				if amIBeingConnectedToThis(kubecluster) {
+					shared.LogInfof(
+						reqLogger,
+						cr,
+						shared.EventReasonCluster,
+						"connected to cluster {%s}; updating it",
+						kubecluster.Name,
+					)
+					shared.LogInfof(
+						reqLogger,
+						&kubecluster,
+						shared.EventReasonCluster,
+						"connected cluster {%s} has changed",
+						cr.Name,
+					)
+					// Annotate cluster to trigger connected cluster's reconciler
+					wait := time.Second
+					maxWait := 4096 * time.Second
+					for {
+						updateMetaGenerator := &kubecluster
+						annotations := updateMetaGenerator.Annotations
+						if annotations == nil {
+							annotations = make(map[string]string)
+							updateMetaGenerator.Annotations = annotations
+						}
+						if v, ok := annotations[shared.ConnectionsIncrementor]; ok {
+							newV, _ := strconv.Atoi(v)
+							annotations[shared.ConnectionsIncrementor] = strconv.Itoa(newV + 1)
+						} else {
+							annotations[shared.ConnectionsIncrementor] = "1"
+						}
+						updateMetaGenerator.Annotations = annotations
+						if shared.Update(context.TODO(), updateMetaGenerator) == nil {
+							break
+						}
+						// Since update failed, get a fresh copy of this cluster to work with and
+						// try update
+						updateMetaGenerator, fetchErr := observer.GetCluster(kubecluster.Namespace, kubecluster.Name)
+						if fetchErr != nil {
+							if errors.IsNotFound(fetchErr) {
+								break
+							}
+						}
+						if wait > maxWait {
+							return fmt.Errorf(
+								"Unable to notify cluster {%s} of configmeta change",
+								updateMetaGenerator.Name)
+						}
+						time.Sleep(wait)
+						wait = wait * 2
+					}
+				}
+			}
 			cr.Status.State = string(clusterReady)
 		}
-		return nil
+
+		if currentHash == cr.Status.LastConnectionHash {
+			return nil
+		}
 	}
 
 	if cr.Status.State != string(clusterCreating) {
@@ -218,14 +328,230 @@ func (r *ReconcileKubeDirectorCluster) syncCluster(
 		return configMetaErr
 	}
 
-	membersHaveChanged := (state == clusterMembersChangedUnready)
-	membersErr := syncMembers(reqLogger, cr, roles, membersHaveChanged, configmetaGen)
+	membersErr := syncMembers(reqLogger, cr, roles, configmetaGen)
 	if membersErr != nil {
 		errLog("members", membersErr)
 		return membersErr
 	}
 
 	return nil
+}
+
+// Calculates md5sum of resource-versions of all resources
+// connected to this cluster
+func calcConnectionsHash(
+	con *kdv1.Connections,
+	ns string,
+) string {
+
+	clusterNames := con.Clusters
+	var buffer bytes.Buffer
+	for _, c := range clusterNames {
+		clusterObj, clusterErr := observer.GetCluster(ns, c)
+		buffer.WriteString(c)
+		var specNum string
+		if clusterErr == nil {
+			// extra careful while dereferencing
+			if clusterObj.Status.SpecGenerationToProcess == nil {
+				specNum = "nil"
+			} else {
+				specNum = strconv.Itoa(
+					int(*clusterObj.Status.SpecGenerationToProcess))
+			}
+		}
+		buffer.WriteString(specNum)
+	}
+	cmNames := con.ConfigMaps
+	for _, c := range cmNames {
+		cmObj, cmErr := observer.GetConfigMap(ns, c)
+		var rv string
+		if cmErr == nil {
+			rv = cmObj.ResourceVersion
+		}
+		buffer.WriteString(c)
+		buffer.WriteString(rv)
+	}
+	secretNames := con.Secrets
+	for _, c := range secretNames {
+		secretObj, secErr := observer.GetSecret(ns, c)
+		var rv string
+		if secErr == nil {
+			rv = secretObj.ResourceVersion
+		}
+		buffer.WriteString(c)
+		buffer.WriteString(rv)
+	}
+	// md5 is very cheap for small strings
+	md5Sum := md5.Sum([]byte(buffer.String()))
+	return hex.EncodeToString(md5Sum[:])
+}
+
+// checkContainerStates updates the lastKnownContainerState in each member
+// status. It will also move ready or config-error nodes back to create pending
+// status if their container ID has changed.
+func checkContainerStates(
+	reqLogger logr.Logger,
+	cr *kdv1.KubeDirectorCluster,
+) {
+
+	numRoleStatuses := len(cr.Status.Roles)
+	for i := 0; i < numRoleStatuses; i++ {
+		roleStatus := &(cr.Status.Roles[i])
+		numMemberStatuses := len(roleStatus.Members)
+		for j := 0; j < numMemberStatuses; j++ {
+			memberStatus := &(roleStatus.Members[j])
+			containerID := ""
+			if memberStatus.Pod != "" {
+				memberStatus.StateDetail.LastKnownContainerState = containerMissing
+				pod, podErr := observer.GetPod(cr.Namespace, memberStatus.Pod)
+				if podErr == nil {
+					for _, containerStatus := range pod.Status.ContainerStatuses {
+						if containerStatus.Name == executor.AppContainerName {
+							containerID = containerStatus.ContainerID
+							if containerStatus.State.Running != nil {
+								if (cr.Status.SpecGenerationToProcess != nil) &&
+									(memberStatus.StateDetail.LastConfigDataGeneration != nil) &&
+									(*cr.Status.SpecGenerationToProcess != *memberStatus.StateDetail.LastConfigDataGeneration) {
+									memberStatus.StateDetail.LastKnownContainerState = containerUnresponsive
+								} else if len(memberStatus.StateDetail.PendingNotifyCmds) != 0 {
+									memberStatus.StateDetail.LastKnownContainerState = containerUnresponsive
+								} else {
+									memberStatus.StateDetail.LastKnownContainerState = containerUnknown
+									for _, condition := range pod.Status.Conditions {
+										if condition.Type == corev1.PodReady {
+											switch condition.Status {
+											case corev1.ConditionTrue:
+												memberStatus.StateDetail.LastKnownContainerState = containerRunning
+											case corev1.ConditionFalse:
+												memberStatus.StateDetail.LastKnownContainerState = containerUnresponsive
+											}
+											break
+										}
+									}
+								}
+							} else if containerStatus.State.Waiting != nil {
+								// Don't rely on the waiting state Reason here
+								// to determine if init is running; it's an
+								// arbitrary string we possibly can't depend on.
+								if (len(pod.Status.InitContainerStatuses) != 0) &&
+									(pod.Status.InitContainerStatuses[0].State.Terminated == nil) {
+									memberStatus.StateDetail.LastKnownContainerState = containerInitializing
+								} else {
+									memberStatus.StateDetail.LastKnownContainerState = containerWaiting
+								}
+							} else if containerStatus.State.Terminated != nil {
+								memberStatus.StateDetail.LastKnownContainerState = containerTerminated
+							} else {
+								memberStatus.StateDetail.LastKnownContainerState = containerUnknown
+							}
+							break
+						}
+					}
+				} else {
+					if !errors.IsNotFound(podErr) {
+						memberStatus.StateDetail.LastKnownContainerState = containerUnknown
+					}
+				}
+				if (memberStatus.State == string(memberReady)) ||
+					(memberStatus.State == string(memberConfigError)) {
+					if containerID != memberStatus.StateDetail.LastConfiguredContainer {
+						memberStatus.State = string(memberCreatePending)
+						if memberStatus.PVC == "" {
+							shared.LogInfof(
+								reqLogger,
+								cr,
+								shared.EventReasonMember,
+								"container ID has changed for member{%s}; no persistent storage, will re-run setup",
+								memberStatus.Pod,
+							)
+							// No persistent storage, so any previously uploaded
+							// stuff has been lost.
+							memberStatus.StateDetail.LastConfigDataGeneration = nil
+							memberStatus.StateDetail.LastSetupGeneration = nil
+							// We will completely rerun the config, so drop any
+							// pending notifies.
+							memberStatus.StateDetail.PendingNotifyCmds = []*kdv1.NotificationDesc{}
+						} else {
+							shared.LogInfof(
+								reqLogger,
+								cr,
+								shared.EventReasonMember,
+								"container ID has changed for member{%s}; will re-check setup",
+								memberStatus.Pod,
+							)
+						}
+					}
+				}
+			}
+		}
+	}
+}
+
+// updateStateRollup examines current per-member status and sets the top-level
+// config rollup appropriately.
+func updateStateRollup(
+	cr *kdv1.KubeDirectorCluster,
+) {
+
+	cr.Status.MemberStateRollup.MembershipChanging = false
+	cr.Status.MemberStateRollup.MembersDown = false
+	cr.Status.MemberStateRollup.MembersInitializing = false
+	cr.Status.MemberStateRollup.MembersWaiting = false
+	cr.Status.MemberStateRollup.MembersRestarting = false
+	cr.Status.MemberStateRollup.ConfigErrors = false
+
+	checkMemberDown := func(memberStatus kdv1.MemberStatus) {
+		if (memberStatus.StateDetail.LastKnownContainerState == containerTerminated) ||
+			(memberStatus.StateDetail.LastKnownContainerState == containerUnresponsive) ||
+			(memberStatus.StateDetail.LastKnownContainerState == containerMissing) {
+			cr.Status.MemberStateRollup.MembersDown = true
+		}
+	}
+
+	for _, roleStatus := range cr.Status.Roles {
+		for _, memberStatus := range roleStatus.Members {
+			switch memberState(memberStatus.State) {
+			case memberCreatePending:
+				// DO NOT check member down here; missing container is OK.
+				// See if this member is new or is "rebooting".
+				if memberStatus.StateDetail.LastConfiguredContainer == "" {
+					cr.Status.MemberStateRollup.MembershipChanging = true
+				} else {
+					cr.Status.MemberStateRollup.MembersRestarting = true
+				}
+				// Count missing container as waiting, at this point.
+				if memberStatus.StateDetail.LastKnownContainerState == containerMissing {
+					cr.Status.MemberStateRollup.MembersWaiting = true
+				}
+			case memberCreating:
+				checkMemberDown(memberStatus)
+				// See if this member is new or is "rebooting".
+				if memberStatus.StateDetail.LastConfiguredContainer == "" {
+					cr.Status.MemberStateRollup.MembershipChanging = true
+				} else {
+					cr.Status.MemberStateRollup.MembersRestarting = true
+				}
+				// DO NOT treat missing container as waiting, at this point.
+			case memberReady:
+				checkMemberDown(memberStatus)
+			case memberDeletePending:
+				checkMemberDown(memberStatus)
+				cr.Status.MemberStateRollup.MembershipChanging = true
+			case memberDeleting:
+				// DO NOT check member down here; missing container is OK.
+				cr.Status.MemberStateRollup.MembershipChanging = true
+			case memberConfigError:
+				checkMemberDown(memberStatus)
+				cr.Status.MemberStateRollup.ConfigErrors = true
+			}
+			if memberStatus.StateDetail.LastKnownContainerState == containerInitializing {
+				cr.Status.MemberStateRollup.MembersInitializing = true
+			}
+			if memberStatus.StateDetail.LastKnownContainerState == containerWaiting {
+				cr.Status.MemberStateRollup.MembersWaiting = true
+			}
+		}
+	}
 }
 
 // handleNewCluster looks in the cache for the last-known status generation

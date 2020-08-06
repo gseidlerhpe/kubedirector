@@ -37,18 +37,24 @@ cgo_enabled := 0
 .DEFAULT_GOAL := build
 
 version-check:
-	@if go version | grep -q 'go1\.1[2-9]'; then \
+	@if go version | grep -q 'go1\.1[3-9]'; then \
         true; \
     else \
         echo "Error:"; \
-        echo "go version 1.12 or later is required"; \
+        echo "go version 1.13 or later is required"; \
+        exit 1; \
+    fi
+	@if operator-sdk version | grep -q 'operator-sdk version: "v0.15.2'; then \
+        true; \
+    else \
+        echo "Error:"; \
+        echo "operator-sdk version 0.15.2 is required"; \
         exit 1; \
     fi
 
-build: configcli pkg/apis/kubedirector.bluedata.io/v1alpha1/zz_generated.deepcopy.go version-check | $(build_dir)
+build: configcli pkg/apis/kubedirector/v1beta1/zz_generated.deepcopy.go version-check | $(build_dir)
 	@echo
 	@echo \* Creating KubeDirector deployment image and YAML...
-	@test -d vendor || dep ensure -v
 	operator-sdk build ${image}
 	@docker image prune -f > /dev/null
 	@sed -e 's~REPLACE_IMAGE~${image}~' deploy/operator.yaml >${local_deploy_yaml}
@@ -60,11 +66,10 @@ configcli:
      echo "* Downloading configcli package ...";                               \
      curl -L -o $(configcli_dest) https://github.com/bluek8s/configcli/archive/v$(configcli_version).tar.gz
 
-pkg/apis/kubedirector.bluedata.io/v1alpha1/zz_generated.deepcopy.go:  \
-        pkg/apis/kubedirector.bluedata.io/v1alpha1/kubedirectorapp_types.go \
-        pkg/apis/kubedirector.bluedata.io/v1alpha1/kubedirectorcluster_types.go \
-        pkg/apis/kubedirector.bluedata.io/v1alpha1/kubedirectorconfig_types.go
-	@test -d vendor || dep ensure -v
+pkg/apis/kubedirector/v1beta1/zz_generated.deepcopy.go:  \
+        pkg/apis/kubedirector/v1beta1/kubedirectorapp_types.go \
+        pkg/apis/kubedirector/v1beta1/kubedirectorcluster_types.go \
+        pkg/apis/kubedirector/v1beta1/kubedirectorconfig_types.go
 	operator-sdk generate k8s
 
 push:
@@ -80,15 +85,12 @@ push:
 
 deploy:
 	@set -e; \
-        all_namespaces=`kubectl get ns --no-headers| awk '{print $$1}'`; \
-        for ns in $$all_namespaces; do \
-            pods_gone=False; \
-            kubectl -n $$ns get -o jsonpath='{.items[0].metadata.name}' pods -l name=${project_name} &> /dev/null || pods_gone=True; \
-            if [[ "$$pods_gone" != "True" ]]; then \
-                echo "KubeDirector pod already exists in namespace $$ns. Maybe old pod is still terminating?"; \
-                exit 1; \
-            fi; \
-        done; \
+        pods_gone=False; \
+        kubectl get -o jsonpath='{.items[0].metadata.name}' pods -l name=${project_name} -A &> /dev/null || pods_gone=True; \
+        if [[ "$$pods_gone" != "True" ]]; then \
+            echo "KubeDirector pod already exists. Maybe the old pod is still terminating?"; \
+            exit 1; \
+        fi; \
         kubectl_ns=`kubectl config get-contexts | grep '^\*' | awk '{print $$5}'`; \
         if [[ -z "$$kubectl_ns" ]]; then \
             cp -f deploy/kubedirector/rbac-default.yaml deploy/kubedirector/rbac.yaml; \
@@ -98,9 +100,9 @@ deploy:
 
 	@echo
 	@echo \* Creating custom resource definitions...
-	kubectl create -f deploy/kubedirector/kubedirector_v1alpha1_kubedirectorapp_crd.yaml
-	kubectl create -f deploy/kubedirector/kubedirector_v1alpha1_kubedirectorcluster_crd.yaml
-	kubectl create -f deploy/kubedirector/kubedirector_v1alpha1_kubedirectorconfig_crd.yaml
+	kubectl create -f deploy/kubedirector/kubedirector.hpe.com_kubedirectorapps_crd.yaml
+	kubectl create -f deploy/kubedirector/kubedirector.hpe.com_kubedirectorclusters_crd.yaml
+	kubectl create -f deploy/kubedirector/kubedirector.hpe.com_kubedirectorconfigs_crd.yaml
 	@echo
 	@echo \* Creating role and service account...
 	kubectl create -f deploy/kubedirector/rbac.yaml
@@ -189,17 +191,10 @@ redeploy:
 undeploy:
 	@echo
 	@true; \
-        function delete_thing { \
-            if [[ "$$3" == "" ]]; then \
-                namespace_arg=""; \
-                kind=$$1; \
-                name=$$2; \
-            else \
-                namespace_arg=" -n $$1"; \
-                kind=$$2; \
-                name=$$3; \
-            fi; \
-            cmd="kubectl$$namespace_arg delete $$kind $$name --now"; \
+        function delete_cluster_thing { \
+            kind=$$1; \
+            name=$$2; \
+            cmd="kubectl delete $$kind $$name --now"; \
             msg=$$($$cmd 2>&1); \
             if [[ "$$?" == "0" ]]; then \
                 echo $$cmd; \
@@ -214,8 +209,31 @@ undeploy:
                 fi; \
             fi; \
         }; \
+        function delete_namespaced_thing { \
+            kind=$$1; \
+            name=$$2; \
+            ns_s_containing_kd_cmd="kubectl get $$kind -A --field-selector=$"metadata.name=$$name$" -o jsonpath='{.items[*].metadata.namespace}'"; \
+            ns_s_containing_kd=$$($$ns_s_containing_kd_cmd); \
+            for ns in $$ns_s_containing_kd; do \
+                ns=$$(echo "$$ns" | tr -d "'"); \
+                cmd="kubectl delete $$kind $$name -n $$ns --now"; \
+                msg=$$($$cmd 2>&1); \
+                if [[ "$$?" == "0" ]]; then \
+                    echo $$cmd; \
+                    if [[ "$$msg" != "" ]]; then \
+                        echo "$$msg"; \
+                    fi; \
+                else \
+                    if [[ ! "$$msg" =~ "Error from server (NotFound):" ]]; then \
+                        echo $$cmd; \
+                        echo "$$msg"; \
+                        exit 1; \
+                    fi; \
+                fi; \
+            done; \
+        }; \
         function delete_all_things { \
-            cmd="kubectl -n $$1 delete $$2 --all --now"; \
+            cmd="kubectl delete $$1 --all=true -A --now"; \
             msg=$$($$cmd 2>&1); \
             if [[ "$$?" == "0" ]]; then \
                 if [[ "$$msg" != "No resources found" ]]; then \
@@ -232,51 +250,40 @@ undeploy:
                 fi; \
             fi; \
         }; \
-        all_namespaces=`kubectl get ns --no-headers| awk '{print $$1}'`; \
         echo \* Deleting any managed virtual clusters...; \
-        for ns in $$all_namespaces; do \
-            delete_all_things $$ns ${cluster_resource_name}; \
-        done; \
+        delete_all_things ${cluster_resource_name}; \
         echo; \
         echo \* Deleting any application types...; \
-        for ns in $$all_namespaces; do \
-            delete_all_things $$ns ${app_resource_name}; \
-        done; \
+        delete_all_things ${app_resource_name}; \
         echo; \
         echo \* Deleting any configs...; \
-        for ns in $$all_namespaces; do \
-            delete_all_things $$ns ${config_resource_name}; \
-        done; \
+        delete_all_things ${config_resource_name}; \
         echo; \
         echo \* Deleting KubeDirector deployment...; \
-        for ns in $$all_namespaces; do \
-            delete_thing $$ns deployment ${project_name}; \
-        done; \
+        delete_namespaced_thing deployment ${project_name}; \
         echo; \
         echo \* Deleting role and service account...; \
-        delete_thing clusterrolebinding ${project_name}; \
-        delete_thing clusterrole ${project_name}; \
-        for ns in $$all_namespaces; do \
-            delete_thing $$ns serviceaccount ${project_name}; \
-        done; \
+        delete_cluster_thing clusterrolebinding ${project_name}; \
+        delete_cluster_thing clusterrole ${project_name}; \
+        delete_namespaced_thing serviceaccount ${project_name}; \
         echo; \
         echo \* Deleting custom resource definitions...; \
-        delete_thing customresourcedefinition ${app_resource_name}s.kubedirector.bluedata.io; \
-        delete_thing customresourcedefinition ${cluster_resource_name}s.kubedirector.bluedata.io; \
-        delete_thing customresourcedefinition ${config_resource_name}s.kubedirector.bluedata.io
+        delete_cluster_thing customresourcedefinition ${app_resource_name}s.kubedirector.hpe.com; \
+        delete_cluster_thing customresourcedefinition ${cluster_resource_name}s.kubedirector.hpe.com; \
+        delete_cluster_thing customresourcedefinition ${config_resource_name}s.kubedirector.hpe.com
 	@echo
 	@echo -n \* Waiting for all cluster resources to finish cleanup...
 	@set -e; \
         retries=100; \
         while [ $$retries ]; do \
-            if kubectl get all -l kubedirectorcluster --all-namespaces 2>&1 >/dev/null | grep "No resources found" &> /dev/null; then \
+            if kubectl get all -l kubedirector.hpe.com/kdcluster --all-namespaces 2>&1 >/dev/null | grep "No resources found" &> /dev/null; then \
                 exit 0; \
             else \
                 retries=`expr $$retries - 1`; \
                 if [ $$retries -le 0 ]; then \
                     echo; \
                     echo Some KubeDirector-managed resources seem to remain.; \
-                    echo Use "kubectl get all -l kubedirectorcluster --all-namespaces" to check and do manual cleanup.; \
+                    echo Use "kubectl get all -l kubedirector.hpe.com/kdcluster --all-namespaces" to check and do manual cleanup.; \
                     exit 1; \
                 fi; \
                 sleep 3; \
@@ -307,48 +314,25 @@ undeploy:
 
 teardown: undeploy
 
-compile: version-check configcli pkg/apis/kubedirector.bluedata.io/v1alpha1/zz_generated.deepcopy.go
+compile: version-check configcli pkg/apis/kubedirector/v1beta1/zz_generated.deepcopy.go
 	-rm -rf ${build_dir}
 	GOOS=linux GOARCH=${goarch} CGO_ENABLED=${cgo_enabled} \
-        go build -o ${build_dir}/bin/${bin_name} ./cmd/manager
+        go build -gcflags "all=-trimpath=$$GOPATH" -o ${build_dir}/bin/${bin_name} ./cmd/manager
 
 format:
-	go fmt $(shell go list ./... | grep -v /vendor/)
-
-dep:
-	dep ensure -v -update
+	go fmt $(shell go list ./...)
 
 clean:
 	-rm -f deploy/kubedirector/rbac.yaml
 	-rm -f deploy/kubedirector/deployment-localbuilt.yaml
-	-rm -f pkg/apis/kubedirector.bluedata.io/v1alpha1/zz_generated.deepcopy.go
+	-rm -f pkg/apis/kubedirector/v1beta1/zz_generated.deepcopy.go
 	-rm -rf ${build_dir}
-
-distclean: clean
-	-rm -rf vendor
+	-rm -f ${configcli_dest}
 
 modules:
-	GO111MODULE="on" go mod tidy
+	go mod tidy
 
-verify-modules:
-	rm -f go.mod go.sum
-	-GO111MODULE="on" go mod init
-	-GO111MODULE="on" go mod tidy
-	@# This line checks that we haven't changed the go.mod or go.sum file
-	@# apart from the first line (because Travis thinks that the local build
-	@# is under the _user's own_ module)
-	@if [ $$(git --no-pager diff --unified=0 --no-color -- go.mod go.sum | \
-             grep -Ev "^(-{3}|\+{3}|\@{2}|diff|index).*$$" | \
-             grep -Ev ".*github.com/.+?/kubedirector.*$$" | \
-             wc -c) -eq 0 ] ; then \
-        echo "no module changes, good job!" ; \
-    else \
-        echo "changes to go modules" ; \
-        echo "make sure to run \`make modules\` before checking in" ; \
-        git --no-pager diff --unified=0 -- go.mod go.sum ; \
-        dep version ; \
-        exit 1 ; \
-    fi
+tidy: modules
 
 golint:
 	@if [ $$(golint \
@@ -379,4 +363,4 @@ check-format:
 $(build_dir):
 	@mkdir -p $@
 
-.PHONY: build push deploy redeploy undeploy teardown format dep clean distclean compile verify-modules modules golint check-format
+.PHONY: version-check build configcli push deploy redeploy undeploy teardown compile format clean modules tidy golint check-format

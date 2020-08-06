@@ -1,5 +1,5 @@
 {
-    "apiVersion": "kubedirector.bluedata.io/v1alpha1",
+    "apiVersion": "kubedirector.hpe.com/v1beta1",
     "kind": "KubeDirectorApp",
     "metadata": {
         "name" : "cdh5142cm"
@@ -8,6 +8,7 @@
     "spec" : {
         "systemdRequired" : true,
         "defaultPersistDirs" : ["/usr", "/opt", "/var", "/data"],
+        "defaultEventList" : ["configure", "addnodes", "delnodes"],
         "capabilities" : [
             "SYS_PACCT",
             "SYS_RESOURCE",
@@ -71,11 +72,11 @@
         },
         "defaultImageRepoTag": "docker.io/bluedata/cdh5142cm:3.0",
         "label": {
-            "name": "CDH 5.14.2 on 7x with Cloudera Manager",
+            "name": "CDH 5.14.2",
             "description": "CDH 5.14.2 with YARN support. Includes Pig, Hive, and Hue."
         },
         "distroID": "bluedata/cdh51427x",
-        "version": "1.4",
+        "version": "1.5",
         "configSchemaVersion": 7,
         "services": [
             {

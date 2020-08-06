@@ -1,3 +1,160 @@
+# v0.5.0 - Jul 16, 2020
+
+The major change in this release is the move from operator SDK v0.8.1 to v0.15.2, which has a couple of notable sets of consequences:
+* Anyone building KubeDirector from source, as opposed to using a pre-built operator image, should re-read [doc/kubedirector-development.md](doc/kubedirector-development.md) to become acquainted with new requirements and with some tips for continuing to build your existing local repo. We highly recommend reading this **before** merging the new release source into your existing source.
+* Anyone who is currently running a KubeDirector 0.4.x deployment and is interested in updating that deployment in-place should read [doc/upgrade.md](doc/upgrade.md).
+
+KD 0.5.0 supports some additional properties in [KubeDirectorApp](https://github.com/bluek8s/kubedirector/wiki/KubeDirectorApp-Definition) and [KubeDirectorCluster](https://github.com/bluek8s/kubedirector/wiki/KubeDirectorCluster-Definition); see the "properties supported by KD v0.5.0+" sections in those tables. These implement three new features:
+* A KD app can indicate that a unique token should be generated to be used for authentication to a service endpoint. This token will be visible in the KD cluster member status, visible within the relevant container (through configcli) for use in setting up that service, and also advertised through an annotation on the K8s Service resource for that member.
+* A KD app can define which lifecycle events (among "configure"/"addnodes"/"delnodes") the members in a role actually care about being notified for. If we can skip sending notifications to a member, then it matters less if that member is down when a KD cluster is reconfigured.
+* A KD cluster can specify a list of "connections" to certain other resources (secrets, configmaps, and/or other KD clusters) whose configuration will be shared within the container (through confligcli). This info will be updated as the connections list is edited or the resources are modified. See the wiki for more details.
+
+The [example catalog of KD apps](https://github.com/bluek8s/kubedirector/tree/master/deploy/example_catalog) has also been significantly reworked and expanded, including additional complex applications and a collection of [usage documentation](https://github.com/bluek8s/kubedirector/tree/master/deploy/example_catalog/docs). We know we have more to do on the front of app-development documentation and that will be a major focus of the next release!
+
+A final bonus QOL improvement is included for automated deployment of KD app CRs. The KD app validation will now allow a PUT to an existing KD app CR that is being used by existing KD clusters, if it is determined that the resulting document (after defaults-substitutions and any other mutations) will not end up changing the "spec" section that the clusters depend on.
+
+
+# v0.4.2 - Jun 20, 2020
+
+Capturing some bugfixes here while we continue to work toward the 0.5 release, which will introduce new features, add new example kdapps, and move to a newer version of the operator SDK.
+
+Issues addressed in this release:
+
+* [GPU visible in non-GPU-requesting pod](https://github.com/bluek8s/kubedirector/issues/263)
+
+* [configure.stdout/stderr are empty in container](https://github.com/bluek8s/kubedirector/issues/286)
+
+* [don't update LastSetupGeneration until all members have exited transitional state](https://github.com/bluek8s/kubedirector/issues/308)
+
+* [set SpecGenerationToProcess earlier](https://github.com/bluek8s/kubedirector/issues/312)
+
+* [ensure systemd is up before service enable/start](https://github.com/bluek8s/kubedirector/issues/315)
+
+* [don't include zero-member roles in the generated configmeta](https://github.com/bluek8s/kubedirector/issues/317)
+
+
+# v0.4.1 - Apr 14, 2020
+
+Fix for https://github.com/bluek8s/kubedirector/issues/289
+
+
+# v0.4.0 - Feb 24, 2020
+
+This is a major release in a few interesting ways. We've had the chance to get wider use of and feedback on KubeDirector, which has led us to these changes.
+
+First and most obviously, we've moved the API to "beta" rather than "alpha" status, starting as "v1beta1". This means that future releases of KD will not make any changes to the "v1beta1" resource definitions. Also, even when we introduce newer API versions, KD will continue to support "v1beta1" for some time (exact support schedule TBD). If you are familiar with the alpha version of the API, please pay close attention to the new CRDs and their documentation on the wiki.
+
+The namespace of the API has also moved from "kubedirector.bluedata.io" to "kubedirector.hpe.com", to use a domain that we can hold on to going forward.
+
+Another significant change is in the way that KD handles member pods that become unresponsive, either temporarily or permanently. Note that restarting a permanently unresponsive member (likely because of K8s node-down) is still an explicit "delete pod" action by the user; see [issue #274](https://github.com/bluek8s/kubedirector/issues/274) for tracking possible future features in that area. However KD will now automatically take the following actions:
+* If a member is unresponsive and its role did not request persistent storage, KD will perform a from-scratch re-run of its setup script if/when it comes back up as a new container.
+* If a member in "config error" state is restarted, KD will perform a from-scratch re-run of its setup script when it comes back up as a new container.
+* KD will be persistent when attempting to update the "configmeta" JSON inside a container and when attempting to notify a container's setup script of changes. If the member is unresponsive when such an update is attempted, or becomes so during the update, it will be reconfigured and re-notified as necessary if/when it comes back up as a new container.
+
+Finally, a number of properties were added to the status stanza of a KD cluster CR, to advertise additional fine-grained per-member status as well as provide a top-level block of "rollup" status that can be quickly scanned to see what is going on.
+
+The wiki will be updated in the near future to provide more information about these changes and what they mean for app setup, but in the meantime interested parties can refer to the description of [PR #272](https://github.com/bluek8s/kubedirector/pull/272) for some details.
+
+We should also mention an [issue that can arise with KD clusters](https://github.com/coredns/coredns/issues/3693) when using CoreDNS as the DNS service in your K8s cluster. Because this issue has been [resolved on CoreDNS master branch](https://github.com/coredns/coredns/pull/3687) we have chosen not to delay this KD release in search of a workaround.
+
+A complete list of changes in this release:
+
+## App/cluster model
+
+* Additional per-member and rollup status properties as described above, in the wiki, and in [PR #272](https://github.com/bluek8s/kubedirector/pull/272).
+
+* The stable status for the overall KD cluster and each member has been renamed from "ready" to "configured".
+
+* Some changes to the semantics of specifing persistDirs in the KD app resource. This list of directories now explicitly represents the persistence needs of the app; KD may also decide to persist additional directories to support its own operations.
+
+## Operational
+
+* Improved handling for unresponsive and/or rebooted members as described above, in the wiki, and in [PR #272](https://github.com/bluek8s/kubedirector/pull/272).
+
+* Post-container-start modifications to /etc/resolv.conf can now survive certain races in container bringup and mounts.
+
+* Fixed operator-restart problems caused when GET through the split K8s client initially returns 404 for resources that actually exist.
+
+* Fixed behavior of persistent storage in cases where a directory in persistDirs does not exist (was causing storage to be re-initialized on member restart).
+
+* Support for a liveness probe via the /healthz URL on port 8443. See the comments in the deployment YAML for an example of how to enable the probe, and why you might not want to do this during development.
+
+* Regularized the naming of generated objects:
+  * headless service is named kdhs-\<hs-unique>
+  * statefulset is named kdss-\<ss-unique>
+  * pod in statefulset is named kdss-\<ss-unique>-\<podnum>
+  * service exposing a pod's ports is named s-kdss-\<ss-unique>-\<podnum>
+  * PVC persisting a pod's data is named p-kdss-\<ss-unique>-\<podnum>
+
+* Regularized the labelling of generated objects:
+  * Labels on any statefulset, pod, or service (either per-member or headless) created by KD:
+    * kubedirector.hpe.com/kdcluster: \<kdcluster resource name>
+    * kubedirector.hpe.com/kdapp: \<kdapp resource name>
+    * kubedirector.hpe.com/appCatalog: \<"local" or "system">
+  * Labels on any statefulset, pod, or per-member service created by KD:
+    * kubedirector.hpe.com/role: \<kdapp role ID>
+  * Labels on any statefulset or pod created by KD:
+    * kubedirector.hpe.com/headless: \<name of headless cluster service>
+
+* Annotation on any statefulset, pod, or service created by KD:
+  * kubedirector.hpe.com/kdapp-prettyName: \<KD app label name>
+
+
+## Developer support
+
+* Added "shortname" variants of the CRs: kdapp, kdcluster, and kdconfig.
+
+* Made updates to the catalog of example kdapps, especially fixes for the example TensorFlow app.
+
+* "make compile" changed to use the trimpath option. Also cf. [issue #266](https://github.com/bluek8s/kubedirector/issues/266).
+
+
+# v0.3.2 - Jan 30, 2020
+
+As sometimes happens, it looks like we need a fix for one of those fixes. Cf. [issue #253](https://github.com/bluek8s/kubedirector/issues/253).
+
+If you are coming to this release straight from v0.3.0, make sure to also read the change history for v0.3.1 below.
+
+
+# v0.3.1 - Jan 29, 2020
+
+Primarily we're pushing this release to make some bugfixes public, but there are a few other nice changes included.
+
+Note that our baseline for supported Kubernetes versions has been raised to 1.14. This was necessary to have support for proper CR schema validation. If you're creating your K8s cluster using a cloud service, pay close attention to the version of K8s that you request.
+
+Also note that in the next release we will be changing the API namespace for our CRs from "kubedirector.bluedata.io/v1alpha1" to "kubedirector.hpe.com/v1beta1". We have _not_ yet made this change; this is just a heads-up.
+
+## App/cluster model
+
+* Better schema-based validation for CRs.
+
+* New optional clusterSvcDomainBase property in the KubeDirectorConfig spec.
+
+* New optional podLabels and serviceLabels property in role spec, to place specified labels on generated resources.
+
+## Operational
+
+* Fixed some DNS issues by setting publishNotReadyAddresses=true for the headless cluster service.
+
+* New port naming format for ports on generated service resources; port name is now prefixed with the urlScheme from the app service definition ("generic-" prefix if no urlScheme).
+
+* Liveness probe added for the operator pod.
+
+* Changes to CRs will now be rejected if the operator itself is down.
+
+* Some fixes for proper handling of the persistent storage in KDClusters that don't use a config package, and some fixes for those that do.
+
+## Developer support
+
+* Many updated docs, especially for GKE and EKS.
+
+* Changed example apps to include the config package on the container image, for easier deployment in K8s clusters that don't have S3 access.
+
+* New TensorFlow example app (old one removed).
+
+* Some reduction of log verbosity.
+
+
 # v0.3.0 - Nov 16, 2019
 
 The most extensive change in this release is that the version of the operator SDK used by KubeDirector has been updated from v0.0.6 to v0.8.1. This picks up the operator SDK's transition to being based on the Kubernetes controller-runtime project. The effects from that change propagated into most corners of the KubeDirector codebase; while the functional difference is not generally visible to the end user, this should put us on a better footing for future updates and maintenance.

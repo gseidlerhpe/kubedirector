@@ -27,7 +27,7 @@ const (
 	KubeDirectorGlobalConfig = "kd-global-config"
 
 	//KdDomainBase - Annotation DNS subdomain prefix
-	KdDomainBase = "kubedirector.bluedata.io"
+	KdDomainBase = "kubedirector.hpe.com"
 
 	// DefaultServiceType - default service type if not specified in
 	// the configCR
@@ -36,15 +36,23 @@ const (
 
 // Event reason constants for recording events
 const (
-	EventReasonNoEvent = ""
-	EventReasonCluster = "Cluster"
-	EventReasonRole    = "Role"
-	EventReasonMember  = "Member"
-	EventReasonConfig  = "Config"
+	EventReasonNoEvent   = ""
+	EventReasonCluster   = "Cluster"
+	EventReasonRole      = "Role"
+	EventReasonMember    = "Member"
+	EventReasonConfig    = "Config"
+	EventReasonConfigMap = "ConfigMap"
+	EventReasonSecret    = "Secret"
 )
 
 // Settings for appCatalog
 const (
 	AppCatalogLocal  = "local"
 	AppCatalogSystem = "system"
+)
+
+// Used by configmap, secret and cluster reconciler to update connection
+// changes
+const (
+	ConnectionsIncrementor = KdDomainBase + "/connUpdateCounter"
 )

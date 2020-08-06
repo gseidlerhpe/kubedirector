@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/bluek8s/kubedirector/pkg/cert"
 	"github.com/bluek8s/kubedirector/pkg/observer"
 	"github.com/bluek8s/kubedirector/pkg/shared"
 	"github.com/bluek8s/kubedirector/pkg/triple"
@@ -28,8 +29,6 @@ import (
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
-	"k8s.io/client-go/util/cert"
-	// "k8s.io/client-go/util/cert/triple"
 )
 
 // createWebhookService creates our webhook Service resource if it does not
@@ -82,7 +81,7 @@ func createWebhookService(
 			},
 		},
 	}
-	return shared.Client().Create(context.TODO(), service)
+	return shared.Create(context.TODO(), service)
 }
 
 // createAdmissionService creates our MutatingWebhookConfiguration resource
@@ -112,20 +111,16 @@ func createAdmissionService(
 		return nil
 	}
 
-	webhookHandler := v1beta1.Webhook{
+	// Webhook handler with a "fail" failure policy; these operations
+	// will NOT be allowed even when the handler is down.
+	// Use the v1beta1 version until our K8s version support floor is 1.16 or
+	// better.
+	failurePolicy := v1beta1.Fail
+	// Also note that until we raise our K8s support floor to 1.15, we can't
+	// use any properties in v1beta1.MutatingWebhook that were not also
+	// present in the old v1beta1.Webhook.
+	webhookHandler := v1beta1.MutatingWebhook{
 		Name: webhookHandlerName,
-		Rules: []v1beta1.RuleWithOperations{{
-			Operations: []v1beta1.OperationType{
-				v1beta1.Create,
-				v1beta1.Update,
-				v1beta1.Delete,
-			},
-			Rule: v1beta1.Rule{
-				APIGroups:   []string{"kubedirector.bluedata.io"},
-				APIVersions: []string{"v1alpha1"},
-				Resources:   []string{"*"},
-			},
-		}},
 		ClientConfig: v1beta1.WebhookClientConfig{
 			Service: &v1beta1.ServiceReference{
 				Namespace: namespace,
@@ -134,6 +129,32 @@ func createAdmissionService(
 			},
 			CABundle: signingCert,
 		},
+		Rules: []v1beta1.RuleWithOperations{
+			// For kubedirectorclusters and kubedirectorconfigs, we don't
+			// actually do any delete validation, but if our whole operator is
+			// down (most likely failure case) the object won't go away
+			// because the reconciler won't remove its finalizer. And you
+			// can't manually remove the finalizer without doing an update. So
+			// let's head all of that off by just registering for Delete
+			// (with Fail failure policy) for those resources too.
+			{
+				Operations: []v1beta1.OperationType{
+					v1beta1.Create,
+					v1beta1.Update,
+					v1beta1.Delete,
+				},
+				Rule: v1beta1.Rule{
+					APIGroups:   []string{"kubedirector.hpe.com"},
+					APIVersions: []string{"v1beta1"},
+					Resources: []string{
+						"kubedirectorconfigs",
+						"kubedirectorapps",
+						"kubedirectorclusters",
+					},
+				},
+			},
+		},
+		FailurePolicy: &failurePolicy,
 	}
 
 	validator := &v1beta1.MutatingWebhookConfiguration{
@@ -145,10 +166,10 @@ func createAdmissionService(
 			Name:            validatorWebhook,
 			OwnerReferences: []metav1.OwnerReference{ownerReference},
 		},
-		Webhooks: []v1beta1.Webhook{webhookHandler},
+		Webhooks: []v1beta1.MutatingWebhook{webhookHandler},
 	}
 
-	return shared.Client().Create(context.TODO(), validator)
+	return shared.Create(context.TODO(), validator)
 }
 
 // createCertsSecret creates a self-signed certificate and stores it as a
@@ -199,7 +220,7 @@ func createCertsSecret(
 		},
 	}
 
-	result := shared.Client().Create(context.TODO(), secret)
+	result := shared.Create(context.TODO(), secret)
 
 	return secret, result
 }
